@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""
+penbind - map an active-pen / Bluetooth button to desktop actions.
+
+Desktop-agnostic: it reads the pen's input device directly (evdev), grabs it so
+its keys never leak to the system (this is what stops the laptop sleeping when the
+top button emits KEY_POWER), and runs a command per gesture.
+
+The pen itself distinguishes single / double / long press by sending *different*
+keys, so penbind needs no timing logic -- it just learns which key each gesture
+emits (which can differ per model) and maps it to an action.
+
+Subcommands:
+  penbind learn       Interactively capture each gesture's key, then pick actions.
+  penbind configure   Re-pick actions for already-learned gestures (no re-capture).
+  penbind run         Daemon: watch the pen and run mapped actions (used by systemd).
+  penbind status      Show config + whether the pen is currently connected.
+  penbind pair        Helper to pair the pen over Bluetooth (bluetoothctl).
+  penbind list-actions  Print the preset action menu.
+"""
+from __future__ import annotations
+import argparse, glob, json, os, re, shutil, subprocess, sys, time
+
+CONFIG_DIR = os.path.expanduser("~/.config/penbind")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+# Standard modifier keys -- not used as a gesture "trigger".
+MODIFIERS = {
+    "KEY_LEFTMETA", "KEY_RIGHTMETA", "KEY_LEFTCTRL", "KEY_RIGHTCTRL",
+    "KEY_LEFTSHIFT", "KEY_RIGHTSHIFT", "KEY_LEFTALT", "KEY_RIGHTALT",
+}
+
+# Default gesture list. A model that only has one button still works -- you just
+# learn "single" and leave the rest as "none".
+DEFAULT_GESTURES = ["single", "double", "long"]
+
+DEFAULT_DEVICE = {"name_regex": "Active Pen", "vendor": None, "product": None}
+
+
+def preset_actions():
+    """name -> shell command (or None to resolve at runtime / disabled)."""
+    return {
+        "none": None,
+        "open-rnote": "flatpak run com.github.flxzt.rnote",
+        "screenshot": _first_available(
+            ["spectacle", "gnome-screenshot", "flameshot gui", "grim"]
+        ),
+        "lock-screen": "loginctl lock-session",
+        "volume-up": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+",
+        "volume-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-",
+        "mute": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+        "media-playpause": "playerctl play-pause",
+    }
+
+
+def _first_available(cmds):
+    for c in cmds:
+        if shutil.which(c.split()[0]):
+            return c
+    return None
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+def default_config():
+    return {
+        "device": dict(DEFAULT_DEVICE),
+        "gestures": {g: {"trigger": None, "modifiers": [], "action": "none"}
+                     for g in DEFAULT_GESTURES},
+    }
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        return default_config()
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    # forward-compatible defaults
+    cfg.setdefault("device", dict(DEFAULT_DEVICE))
+    cfg.setdefault("gestures", {})
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"saved {CONFIG_PATH}")
+
+
+def resolve_command(action):
+    """An action is either a preset name or a literal shell command."""
+    if not action or action == "none":
+        return None
+    presets = preset_actions()
+    if action in presets:
+        return presets[action]
+    return action  # custom literal command
+
+
+# ---------------------------------------------------------------------------
+# device discovery
+# ---------------------------------------------------------------------------
+def _import_evdev():
+    try:
+        import evdev  # noqa
+        return evdev
+    except ImportError:
+        sys.exit("error: python3-evdev not installed. Run: sudo dnf install -y python3-evdev")
+
+
+def find_device(cfg, evdev):
+    dev = cfg.get("device", {})
+    v, p = dev.get("vendor"), dev.get("product")
+    name_re = dev.get("name_regex")
+    best = None
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+        except (OSError, PermissionError):
+            continue
+        caps = d.capabilities()
+        if evdev.ecodes.EV_KEY not in caps:
+            continue
+        if v is not None and p is not None:
+            if d.info.vendor == v and d.info.product == p:
+                return d
+        if name_re and re.search(name_re, d.name, re.I):
+            best = best or d
+    return best
+
+
+def wait_for_device(cfg, evdev, quiet=False):
+    announced = False
+    while True:
+        d = find_device(cfg, evdev)
+        if d:
+            return d
+        if not quiet and not announced:
+            print("waiting for pen to connect (press the top button to wake it)...")
+            announced = True
+        time.sleep(1.5)
+
+
+# ---------------------------------------------------------------------------
+# launching actions in the user's graphical session
+# ---------------------------------------------------------------------------
+def build_env():
+    env = os.environ.copy()
+    if "WAYLAND_DISPLAY" not in env:
+        xrd = env.get("XDG_RUNTIME_DIR", "")
+        for s in sorted(glob.glob(os.path.join(xrd, "wayland-*"))):
+            if not s.endswith(".lock"):
+                env["WAYLAND_DISPLAY"] = os.path.basename(s)
+                break
+    return env
+
+
+def launch(cmd):
+    if not cmd:
+        return
+    subprocess.Popen(
+        cmd, shell=True, env=build_env(),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# learn
+# ---------------------------------------------------------------------------
+def capture_gesture(dev, evdev, seconds=4.0):
+    """Capture key-down events for `seconds`; return (trigger, [modifiers])."""
+    import select
+    keys_down = []
+    # drain any pending events first
+    try:
+        while dev.read_one():
+            pass
+    except OSError:
+        pass
+    deadline = time.time() + seconds
+    got = False
+    while time.time() < deadline:
+        r, _, _ = select.select([dev.fd], [], [], max(0, deadline - time.time()))
+        if not r:
+            continue
+        try:
+            for e in dev.read():
+                if e.type == evdev.ecodes.EV_KEY and e.value == 1:
+                    name = evdev.ecodes.KEY.get(e.code)
+                    if isinstance(name, list):
+                        name = name[0]
+                    if name and name not in keys_down:
+                        keys_down.append(name)
+                    got = True
+                    deadline = time.time() + 0.8  # extend briefly after first key
+        except OSError:
+            break
+    mods = [k for k in keys_down if k in MODIFIERS]
+    triggers = [k for k in keys_down if k not in MODIFIERS]
+    trigger = triggers[-1] if triggers else (keys_down[-1] if keys_down else None)
+    return (trigger, mods) if got else (None, [])
+
+
+def cmd_learn(args):
+    evdev = _import_evdev()
+    cfg = load_config()
+    dev = wait_for_device(cfg, evdev)
+    print(f"\nUsing pen: {dev.name}  ({dev.path})")
+    print(f"  vendor={hex(dev.info.vendor)} product={hex(dev.info.product)}")
+    # lock vendor/product so matching survives across reconnects / other devices
+    cfg["device"]["vendor"] = dev.info.vendor
+    cfg["device"]["product"] = dev.info.product
+
+    # Grab so the button can't sleep the machine or type while we learn.
+    try:
+        dev.grab()
+        grabbed = True
+    except OSError:
+        grabbed = False
+        print("  (note: could not grab device; the button may still act while learning)")
+
+    gestures = list(cfg.get("gestures") or {}) or DEFAULT_GESTURES
+    prompts = {"single": "PRESS the top button ONCE",
+               "double": "DOUBLE-press the top button",
+               "long": "PRESS and HOLD the top button (~2s)"}
+    learned = {}
+    try:
+        for g in gestures:
+            input(f"\n>> Ready to learn [{g}]. Press Enter, THEN {prompts.get(g, f'do the {g!r} gesture')}...")
+            print("   capturing (~6s) — do the gesture now...")
+            trig, mods = capture_gesture(dev, evdev, seconds=6.0)
+            if trig:
+                combo = "+".join(mods + [trig])
+                print(f"   captured {g}: {combo}")
+                learned[g] = {"trigger": trig, "modifiers": mods}
+            else:
+                print(f"   nothing captured for {g} (skipping — set to none)")
+                learned[g] = {"trigger": None, "modifiers": []}
+    finally:
+        if grabbed:
+            dev.ungrab()
+
+    # warn about collisions (a model that sends the same key for every gesture)
+    seen = {}
+    for g, v in learned.items():
+        t = v["trigger"]
+        if t:
+            seen.setdefault(t, []).append(g)
+    for t, gs in seen.items():
+        if len(gs) > 1:
+            print(f"\n! gestures {gs} all send {t} — they can't be told apart on this pen.")
+
+    # merge into config, then pick actions
+    for g, v in learned.items():
+        cfg["gestures"].setdefault(g, {"action": "none"})
+        cfg["gestures"][g].update(v)
+
+    print("\nNow choose what each gesture does.")
+    for g in gestures:
+        if not cfg["gestures"][g].get("trigger"):
+            continue
+        cfg["gestures"][g]["action"] = pick_action(g, cfg["gestures"][g].get("action", "none"))
+
+    save_config(cfg)
+    print("\nDone. Start/enable the daemon with:  systemctl --user enable --now penbind")
+
+
+# ---------------------------------------------------------------------------
+# configure (actions only)
+# ---------------------------------------------------------------------------
+def pick_action(gesture, current="none"):
+    presets = preset_actions()
+    names = list(presets.keys())
+    print(f"\n  Action for [{gesture}] (current: {current}):")
+    for i, n in enumerate(names):
+        avail = presets[n]
+        tag = "" if (n == "none" or avail) else "  (tool not installed)"
+        cmdtxt = "" if n == "none" else f"  -> {avail or '??'}"
+        print(f"    {i:2}. {n}{cmdtxt}{tag}")
+    print(f"    {len(names):2}. custom command...")
+    while True:
+        raw = input("  choose number (Enter to keep current): ").strip()
+        if raw == "":
+            return current
+        if not raw.isdigit():
+            print("  enter a number.")
+            continue
+        idx = int(raw)
+        if idx == len(names):
+            c = input("  enter shell command: ").strip()
+            if c:
+                return c
+            continue
+        if 0 <= idx < len(names):
+            return names[idx]
+        print("  out of range.")
+
+
+def cmd_configure(args):
+    cfg = load_config()
+    gestures = [g for g, v in cfg.get("gestures", {}).items() if v.get("trigger")]
+    if not gestures:
+        sys.exit("no gestures learned yet — run: penbind learn")
+    for g in gestures:
+        cfg["gestures"][g]["action"] = pick_action(g, cfg["gestures"][g].get("action", "none"))
+    save_config(cfg)
+    print("Reload the daemon:  systemctl --user restart penbind")
+
+
+# ---------------------------------------------------------------------------
+# run (daemon)
+# ---------------------------------------------------------------------------
+def cmd_run(args):
+    evdev = _import_evdev()
+    cfg = load_config()
+    # map trigger key -> (gesture, action command)
+    triggers = {}
+    for g, v in cfg.get("gestures", {}).items():
+        t = v.get("trigger")
+        cmd = resolve_command(v.get("action"))
+        if t and cmd:
+            triggers[t] = (g, cmd)
+    if not triggers:
+        print("no gestures mapped to actions yet — run: penbind learn", flush=True)
+    print(f"penbind: watching for {cfg['device']}", flush=True)
+    print(f"penbind: active mappings: "
+          + ", ".join(f"{g}:{t}->{c}" for t, (g, c) in triggers.items()), flush=True)
+
+    while True:
+        dev = wait_for_device(cfg, evdev, quiet=True)
+        try:
+            dev.grab()
+        except OSError as e:
+            print(f"penbind: could not grab {dev.path}: {e}", flush=True)
+        print(f"penbind: connected {dev.name} ({dev.path})", flush=True)
+        try:
+            for e in dev.read_loop():
+                if e.type != evdev.ecodes.EV_KEY or e.value != 1:
+                    continue
+                name = evdev.ecodes.KEY.get(e.code)
+                if isinstance(name, list):
+                    name = name[0]
+                hit = triggers.get(name)
+                if hit:
+                    g, cmd = hit
+                    print(f"penbind: {g} ({name}) -> {cmd}", flush=True)
+                    launch(cmd)
+        except OSError:
+            print("penbind: pen disconnected, waiting for reconnect...", flush=True)
+            time.sleep(1.0)
+            continue
+
+
+# ---------------------------------------------------------------------------
+# status / pair / list-actions
+# ---------------------------------------------------------------------------
+def cmd_status(args):
+    evdev = _import_evdev()
+    cfg = load_config()
+    print(f"config: {CONFIG_PATH}{'' if os.path.exists(CONFIG_PATH) else '  (not created yet)'}")
+    print(f"device matcher: {cfg['device']}")
+    for g, v in cfg.get("gestures", {}).items():
+        combo = "+".join(v.get("modifiers", []) + ([v["trigger"]] if v.get("trigger") else []))
+        print(f"  {g:7} {combo or '(unlearned)':24} -> {v.get('action','none')}")
+    d = find_device(cfg, evdev)
+    print(f"pen currently: {'CONNECTED ' + d.path if d else 'not connected'}")
+    r = subprocess.run(["systemctl", "--user", "is-active", "penbind"],
+                       capture_output=True, text=True)
+    print(f"daemon: {r.stdout.strip() or 'unknown'}")
+
+
+def cmd_pair(args):
+    mac = args.mac
+    print("Put the pen in pairing mode (hold the top button until the LED blinks steadily),")
+    print("keep it close to the laptop, then we'll trust+connect it.\n")
+    if not mac:
+        print("Scanning 12s for an active pen... (look for 'Active Pen' / 'PN579')")
+        subprocess.run(["bash", "-c",
+                        "bluetoothctl --timeout 12 scan on | grep -iE 'pen|stylus|wacom|dell' || true"])
+        mac = input("\nEnter the pen's MAC address: ").strip()
+    if not mac:
+        sys.exit("no MAC given")
+    for step in (["scan", "on"], ["trust", mac], ["connect", mac]):
+        subprocess.run(["bluetoothctl", *step])
+        time.sleep(1)
+    print(f"\nIf it connected, run: penbind learn")
+
+
+def cmd_list_actions(args):
+    for n, c in preset_actions().items():
+        print(f"  {n:16} {c or ''}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="penbind", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("learn", help="capture gesture keys and pick actions")
+    sub.add_parser("configure", help="re-pick actions (no re-capture)")
+    sub.add_parser("run", help="daemon: watch the pen and run actions")
+    sub.add_parser("status", help="show config and connection state")
+    p = sub.add_parser("pair", help="pair the pen over Bluetooth")
+    p.add_argument("mac", nargs="?", help="pen MAC (optional; scans if omitted)")
+    sub.add_parser("list-actions", help="print preset actions")
+    args = ap.parse_args()
+    {
+        "learn": cmd_learn, "configure": cmd_configure, "run": cmd_run,
+        "status": cmd_status, "pair": cmd_pair, "list-actions": cmd_list_actions,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()

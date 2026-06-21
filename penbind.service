@@ -1,0 +1,12 @@
+[Unit]
+Description=penbind - pen button to action mapper
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/penbind run
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
