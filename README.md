@@ -1,13 +1,20 @@
 # penbind
 
-Map an active-pen / Bluetooth pen **button** to desktop actions on Linux — works on
-any desktop (KDE, GNOME, …), because it reads the pen's input device directly
-instead of relying on desktop shortcuts.
+Maps an active-pen or Bluetooth pen button to desktop actions on Linux, independent of the desktop environment.
 
 Built for the **Dell Active Pen PN579X** (whose top button, over Bluetooth, sends
 `Super+F20` / `Super+F19` / `Super+F18` for single / double / long-press), but it is
 **model-agnostic**: `penbind learn` captures whatever keys *your* pen sends, so it
 adapts to other pens that use different codes.
+
+## Features
+
+- Reads the pen's evdev device directly and **grabs** it, so its keys never reach logind or the desktop.
+- Learns each gesture's key interactively (`penbind learn`), so it works with pens other than the Dell PN579X.
+- Runs a preset or custom shell command per gesture (`penbind run`, managed by a `systemd --user` service).
+- Matches the device by USB/Bluetooth `vendor:product` and/or a name regex, so it survives reconnects.
+- Installs a `uaccess` udev rule, so no `input` group membership or re-login is needed.
+- Warns during `learn` when a pen sends the same key for several gestures.
 
 ## Why a daemon (and not just a desktop shortcut)?
 
@@ -18,7 +25,7 @@ logind/your desktop — no more accidental sleep — and penbind runs your actio
 ## Install
 
 ```sh
-git clone <this repo>   # or copy the folder
+git clone https://github.com/y0c0ms/penbind.git
 cd penbind
 ./install.sh
 ```
@@ -30,7 +37,7 @@ The installer:
   `input` group or logging out,
 - installs a `systemd --user` service.
 
-## Use
+## Run it
 
 ```sh
 penbind pair        # optional: pair the pen over Bluetooth
